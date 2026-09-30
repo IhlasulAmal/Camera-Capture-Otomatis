@@ -31,7 +31,10 @@ class CameraCaptureApp:
         self.root.minsize(900, 650)
 
         self.camera: cv2.VideoCapture | None = None
+        self.camera_backend = ""
+        self.camera_backend_by_choice: dict[str, str] = {}
         self.frame = None
+        self.consecutive_read_failures = 0
         self.preview_image: ImageTk.PhotoImage | None = None
         self.last_capture_image: ImageTk.PhotoImage | None = None
         self.last_capture_path: Path | None = None
@@ -158,22 +161,54 @@ class CameraCaptureApp:
         ttk.Label(main, textvariable=self.status).grid(row=4, column=0, columnspan=4, sticky="w", pady=(4, 0))
         self._update_limit_state()
 
+    def _backend_candidates(self) -> list[tuple[str, int]]:
+        candidates = [("DirectShow", cv2.CAP_DSHOW), ("Media Foundation", cv2.CAP_MSMF), ("Default", cv2.CAP_ANY)]
+        available: list[tuple[str, int]] = []
+        seen: set[int] = set()
+        for name, backend in candidates:
+            if backend not in seen:
+                available.append((name, backend))
+                seen.add(backend)
+        return available
+
+    def _open_camera(self, index: int, preferred_backend: str | None = None) -> tuple[cv2.VideoCapture | None, str, object | None]:
+        candidates = self._backend_candidates()
+        if preferred_backend:
+            candidates.sort(key=lambda item: 0 if item[0] == preferred_backend else 1)
+        for backend_name, backend in candidates:
+            camera = cv2.VideoCapture(index, backend)
+            if not camera.isOpened():
+                camera.release()
+                continue
+            if self.resolution_choice.get() != "Otomatis (resolusi kamera)":
+                width, height = (int(value) for value in self.resolution_choice.get().split("x"))
+                camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
+                camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
+            ok, frame = camera.read()
+            if ok and frame is not None and getattr(frame, "size", 0) > 0:
+                return camera, backend_name, frame
+            camera.release()
+        return None, "", None
+
     def refresh_cameras(self) -> None:
         found: list[str] = []
+        self.camera_backend_by_choice.clear()
         for index in range(10):
-            camera = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-            if camera.isOpened():
-                found.append(f"{index} - Kamera {index}")
-            camera.release()
+            camera, backend_name, frame = self._open_camera(index)
+            if camera is not None:
+                label = f"{index} - Kamera {index} ({backend_name})"
+                found.append(label)
+                self.camera_backend_by_choice[label] = backend_name
+                camera.release()
         self.camera_options = found
         self.camera_combo["values"] = found
         if found:
-            if not any(self.camera_choice.get() == item for item in found):
+            if self.camera_choice.get() not in found:
                 self.camera_choice.set(found[0])
-            self.status.set(f"Ditemukan {len(found)} kamera.")
+            self.status.set(f"Ditemukan {len(found)} kamera dengan frame valid.")
         else:
             self.camera_choice.set("")
-            self.status.set("Tidak ada kamera terdeteksi. Periksa koneksi dan izin Windows.")
+            self.status.set("Tidak ada kamera dengan frame valid. Periksa izin, driver, dan aplikasi lain.")
 
     def _camera_index(self) -> int:
         return int(self.camera_choice.get().split(" ", 1)[0])
@@ -191,28 +226,32 @@ class CameraCaptureApp:
         except (ValueError, IndexError):
             messagebox.showwarning("Kamera", "Pilih kamera terlebih dahulu.")
             return
-        camera = cv2.VideoCapture(index, cv2.CAP_DSHOW)
-        if not camera.isOpened():
-            camera.release()
-            messagebox.showerror("Kamera", "Kamera tidak dapat dibuka.")
+        preferred_backend = self.camera_backend_by_choice.get(self.camera_choice.get())
+        camera, backend_name, frame = self._open_camera(index, preferred_backend)
+        if camera is None or frame is None:
+            messagebox.showerror(
+                "Kamera",
+                "Kamera terdeteksi tetapi tidak mengirim frame valid. "
+                "Tutup aplikasi lain yang memakai kamera lalu klik Cari kamera.",
+            )
             return
-
-        if self.resolution_choice.get() != "Otomatis (resolusi kamera)":
-            width, height = (int(value) for value in self.resolution_choice.get().split("x"))
-            camera.set(cv2.CAP_PROP_FRAME_WIDTH, width)
-            camera.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
 
         actual_width = int(camera.get(cv2.CAP_PROP_FRAME_WIDTH))
         actual_height = int(camera.get(cv2.CAP_PROP_FRAME_HEIGHT))
         self.actual_resolution.set(f"Resolusi aktual: {actual_width}x{actual_height}")
         self.camera = camera
-        self.status.set("Kamera aktif. Preview siap.")
+        self.camera_backend = backend_name
+        self.frame = frame
+        self.consecutive_read_failures = 0
+        self.status.set(f"Kamera aktif ({backend_name}). Preview siap.")
 
     def stop_camera(self) -> None:
         self.stop_auto_capture()
         if self.camera is not None:
             self.camera.release()
             self.camera = None
+        self.camera_backend = ""
+        self.consecutive_read_failures = 0
         self.frame = None
         self.preview.configure(image="", text="Preview kamera")
         self.preview_image = None
@@ -221,13 +260,18 @@ class CameraCaptureApp:
     def _update_preview(self) -> None:
         if self.camera is not None:
             ok, frame = self.camera.read()
-            if ok:
+            if ok and frame is not None and frame.size > 0:
                 self.frame = frame
+                self.consecutive_read_failures = 0
                 rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 image = Image.fromarray(rgb)
                 image.thumbnail((1000, 620))
                 self.preview_image = ImageTk.PhotoImage(image)
                 self.preview.configure(image=self.preview_image, text="")
+            else:
+                self.consecutive_read_failures += 1
+                if self.consecutive_read_failures >= 30:
+                    self.status.set(f"Frame kamera gagal dibaca ({self.camera_backend}).")
         self.root.after(30, self._update_preview)
 
     def capture_now(self) -> bool:
